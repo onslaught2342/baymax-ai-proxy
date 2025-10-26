@@ -5,6 +5,7 @@ export interface Env {
 
 const MAX_HISTORY = 20;
 const HISTORY_TTL = 60 * 60 * 24 * 30;
+const VECTOR_API_URL = 'https://vector_local.onslaught2342.qzz.io/search'; // your tunnel endpoint
 
 function corsHeaders(origin?: string) {
 	const allowOrigin = origin ?? '*';
@@ -39,14 +40,11 @@ export default {
 				});
 			}
 
-			// --------------------
-			// /clear endpoint
-			// --------------------
 			if (url.pathname === '/clear' && request.method === 'POST') {
 				let body: any;
 				try {
 					body = await request.json();
-				} catch (e) {
+				} catch {
 					return jsonResponse({ error: 'Invalid JSON body' }, 400, origin);
 				}
 
@@ -65,9 +63,6 @@ export default {
 				}
 			}
 
-			// --------------------
-			// Existing chat endpoint
-			// --------------------
 			if (request.method !== 'POST') {
 				return jsonResponse({ error: 'Only POST allowed' }, 405, origin);
 			}
@@ -95,7 +90,6 @@ export default {
 				return jsonResponse({ error: 'userMessage too long' }, 413, origin);
 			}
 
-			// Load history
 			const historyRaw = await env.CHAT_HISTORY_BAYMAX_PROXY.get(sessionId);
 			let history: Array<{ role: string; content: string }> = historyRaw
 				? JSON.parse(historyRaw)
@@ -106,18 +100,63 @@ export default {
 			const systemMessage = history.find((m) => m.role === 'system') ?? null;
 			const nonSystem = history.filter((m) => m.role !== 'system').slice(-(MAX_HISTORY - (systemMessage ? 1 : 0)));
 			history = systemMessage ? [systemMessage, ...nonSystem] : nonSystem;
+			let context = '';
+			try {
+				const vectorRes = await fetch(VECTOR_API_URL, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ query: userMessage }),
+				});
 
-			// Call Groq API
-			const groqPayload = { model: 'llama-3.1-8b-instant', messages: history, temperature: 0.7 };
+				const vectorData = await vectorRes.json().catch(() => null);
+
+				if (vectorData?.results?.length) {
+					context = vectorData.results
+						.map((r: any) => {
+							const name = r['Medicine Name'] ?? 'Unknown';
+							const use = r['Uses'] ?? 'N/A';
+							const side = r['Side_effects'] ?? 'None listed';
+							return `• ${name}: Used for ${use}. Side effects: ${side}`;
+						})
+						.join('\n');
+				}
+			} catch (err) {
+				context = '';
+			}
+
+			if (context) {
+				history.unshift({
+					role: 'system',
+					content: `Medical database context:\n${context}\n\nRespond as Baymax, using this data carefully.`,
+				});
+			}
+
+			const groqPayload = {
+				model: 'llama-3.1-8b-instant',
+				messages: history,
+				temperature: 0.7,
+			};
+
 			const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GROQ_API_KEY}` },
+				headers: {
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${env.GROQ_API_KEY}`,
+				},
 				body: JSON.stringify(groqPayload),
 			});
 
 			if (!groqRes.ok) {
 				const errText = await groqRes.text().catch(() => '<no-body>');
-				return jsonResponse({ error: 'Upstream model error', upstreamStatus: groqRes.status, detail: errText }, 502, origin);
+				return jsonResponse(
+					{
+						error: 'Upstream model error',
+						upstreamStatus: groqRes.status,
+						detail: errText,
+					},
+					502,
+					origin
+				);
 			}
 
 			const data = await groqRes.json().catch(() => ({} as any));
@@ -128,9 +167,11 @@ export default {
 				'Model returned no reply';
 
 			history.push({ role: 'assistant', content: reply });
-			await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), { expirationTtl: HISTORY_TTL });
+			await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), {
+				expirationTtl: HISTORY_TTL,
+			});
 
-			return jsonResponse({ reply, choices: data?.choices ?? null }, 200, origin);
+			return jsonResponse({ reply, context, choices: data?.choices ?? null }, 200, origin);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			return jsonResponse({ error: 'Internal Server Error', message }, 500, origin);
