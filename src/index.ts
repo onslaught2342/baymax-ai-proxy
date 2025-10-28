@@ -1,11 +1,13 @@
 /// <reference types="@cloudflare/workers-types" />
 import jwt from 'jsonwebtoken';
+import * as bcrypt from 'bcryptjs';
 
 export interface Env {
 	ISSUER_SECRET: string;
 	GROQ_API_KEY: string;
 	CHAT_HISTORY_BAYMAX_PROXY: KVNamespace;
 	VECTOR_API_URL: string;
+	BAYMAX_USERS: KVNamespace; // For auth
 }
 
 interface VectorResult {
@@ -30,7 +32,7 @@ interface GroqResponse {
 
 const MAX_HISTORY = 20;
 const HISTORY_TTL = 60 * 60 * 24 * 30;
-const TOKEN_EXPIRY = 5 * 60;
+const TOKEN_EXPIRY = 60 * 60; // 1 hour
 const TOKEN_REFRESH_THRESHOLD = 60;
 
 function corsHeaders(origin?: string) {
@@ -49,19 +51,18 @@ function jsonResponse(data: unknown, status = 200, origin?: string) {
 	});
 }
 
-function createToken(sessionId: string, secret: string) {
-	return jwt.sign({ sessionId }, secret, { expiresIn: `${TOKEN_EXPIRY}s` });
+function createToken(username: string) {
+	return jwt.sign({ username }, ISSUER_SECRET, { expiresIn: TOKEN_EXPIRY });
 }
 
-async function verifyJWT(token: string, secret: string) {
-	let decoded: any;
+async function verifyJWT(token: string) {
 	try {
-		decoded = jwt.verify(token, secret);
+		const decoded = jwt.verify(token, ISSUER_SECRET) as { username: string };
+		if (!decoded.username) throw new Error('Invalid token payload');
+		return decoded.username;
 	} catch {
-		throw new Response('Unauthorized: invalid token', { status: 401 });
+		throw new Response('Unauthorized', { status: 401 });
 	}
-	if (!decoded.sessionId) throw new Response('Unauthorized: invalid token payload', { status: 401 });
-	return decoded.sessionId;
 }
 
 export default {
@@ -71,14 +72,9 @@ export default {
 		if (origin !== ALLOWED_ORIGIN) return new Response('Forbidden', { status: 403 });
 
 		const url = new URL(request.url);
+		const path = url.pathname;
 
-		if (url.pathname === '/token' && request.method === 'GET') {
-			const sessionId = url.searchParams.get('sessionId');
-			if (!sessionId) return new Response('Missing sessionId', { status: 400 });
-			const token = createToken(sessionId, env.ISSUER_SECRET);
-			return jsonResponse({ token }, 200, origin);
-		}
-
+		// Preflight
 		if (request.method === 'OPTIONS') {
 			return new Response(null, {
 				status: 204,
@@ -86,43 +82,100 @@ export default {
 			});
 		}
 
+		// Signup
+		if (path === '/signup' && request.method === 'POST') {
+			let body: any;
+			try {
+				body = await request.json();
+			} catch {
+				return jsonResponse({ error: 'Invalid JSON' }, 400);
+			}
+			const { username, password } = body;
+			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400);
+
+			const exists = await env.BAYMAX_USERS.get(username);
+			if (exists) return jsonResponse({ error: 'Username already exists' }, 409);
+
+			const hashed = await bcrypt.hash(password, 10);
+			await env.BAYMAX_USERS.put(username, hashed);
+
+			const token = createToken(username);
+			await env.BAYMAX_USERS.put(`${username}_token`, token);
+			return jsonResponse({ token });
+		}
+
+		// Login
+		if (path === '/login' && request.method === 'POST') {
+			let body: any;
+			try {
+				body = await request.json();
+			} catch {
+				return jsonResponse({ error: 'Invalid JSON' }, 400);
+			}
+			const { username, password } = body;
+			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400);
+
+			const stored = await env.BAYMAX_USERS.get(username);
+			if (!stored) return jsonResponse({ error: 'Invalid credentials' }, 401);
+
+			const valid = await bcrypt.compare(password, stored);
+			if (!valid) return jsonResponse({ error: 'Invalid credentials' }, 401);
+
+			const token = createToken(username);
+			await env.BAYMAX_USERS.put(`${username}_token`, token);
+
+			return jsonResponse({ token });
+		}
+
+		// Verify token endpoint (optional)
+		if (path === '/verify') {
+			const authHeader = request.headers.get('Authorization') || '';
+			const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+			if (!token) return jsonResponse({ error: 'Missing token' }, 401);
+			try {
+				const username = await verifyJWT(token);
+				return jsonResponse({ username });
+			} catch (err) {
+				return err instanceof Response ? err : jsonResponse({ error: 'Unauthorized' }, 401);
+			}
+		}
+
+		// For all other requests (Baymax chat)
+		if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405);
+
+		// Authentication required
 		const authHeader = request.headers.get('Authorization') || '';
 		const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 		if (!token) return new Response('Unauthorized: missing token', { status: 401 });
 
-		let sessionId: string;
+		let username: string;
 		try {
-			sessionId = await verifyJWT(token, env.ISSUER_SECRET);
+			username = await verifyJWT(token);
 		} catch (err) {
 			return err instanceof Response ? err : new Response('Unauthorized', { status: 401 });
 		}
 
+		// Optionally refresh token
 		let refreshToken: string | null = null;
 		const decoded: any = jwt.decode(token);
 		if (decoded && decoded.exp && Date.now() / 1000 + TOKEN_REFRESH_THRESHOLD > decoded.exp) {
-			refreshToken = createToken(sessionId, env.ISSUER_SECRET);
+			refreshToken = createToken(username);
+			await env.BAYMAX_USERS.put(`${username}_token`, refreshToken);
 		}
 
-		if (url.pathname === '/clear' && request.method === 'POST') {
-			await env.CHAT_HISTORY_BAYMAX_PROXY.delete(sessionId);
-			return jsonResponse({ success: true, message: 'Session cleared', refreshToken }, 200, origin);
-		}
-
-		if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed', refreshToken }, 405, origin);
-
-		const contentType = (request.headers.get('Content-Type') || '').toLowerCase();
-		if (!contentType.includes('application/json')) return jsonResponse({ error: 'Expected application/json', refreshToken }, 415, origin);
-
+		// Chat logic
 		let body: any;
 		try {
 			body = await request.json();
 		} catch {
-			return jsonResponse({ error: 'Invalid JSON body', refreshToken }, 400, origin);
+			return jsonResponse({ error: 'Invalid JSON', refreshToken }, 400, origin);
 		}
-
 		let userMessage = typeof body.userMessage === 'string' ? body.userMessage.trim() : null;
 		if (!userMessage) return jsonResponse({ error: 'Missing userMessage', refreshToken }, 400, origin);
 		if (userMessage.length > 20000) return jsonResponse({ error: 'userMessage too long', refreshToken }, 413, origin);
+
+		const sessionId = body.sessionId;
+		if (!sessionId) return jsonResponse({ error: 'Missing sessionId', refreshToken }, 400, origin);
 
 		const sanitizedInput = userMessage.replace(/\s+/g, ' ').trim();
 		const historyRaw = await env.CHAT_HISTORY_BAYMAX_PROXY.get(sessionId);
@@ -135,6 +188,7 @@ export default {
 		const nonSystem = history.filter((m) => m.role !== 'system').slice(-(MAX_HISTORY - (systemMessage ? 1 : 0)));
 		history = systemMessage ? [systemMessage, ...nonSystem] : nonSystem;
 
+		// Vector embedding context
 		let context = '';
 		let embeddings: any[] = [];
 		try {

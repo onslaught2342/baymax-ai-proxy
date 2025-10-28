@@ -9,6 +9,10 @@
 		{
 			"binding": "CHAT_HISTORY_BAYMAX_PROXY",
 			"id": "990a6e0dfc844e54a7bc8c56478b6e17"
+		},
+		{
+			"binding": "BAYMAX_USERS",
+			"id": "bfe537428733455280bc35ed0d388540"
 		}
 	]
 }
