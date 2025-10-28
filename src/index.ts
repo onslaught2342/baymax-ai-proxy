@@ -35,10 +35,14 @@ const HISTORY_TTL = 60 * 60 * 24 * 30;
 const TOKEN_EXPIRY = 60 * 60; // 1 hour
 const TOKEN_REFRESH_THRESHOLD = 60;
 
+const ALLOWED_ORIGINS = [
+	'https://baymax.onslaught2342.qzz.io',
+	'https://localhost:5173', // dev origin
+];
+
 function corsHeaders(origin?: string) {
-	const allowOrigin = origin ?? '*';
 	return {
-		'Access-Control-Allow-Origin': allowOrigin,
+		'Access-Control-Allow-Origin': origin ?? '*',
 		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 	};
@@ -51,13 +55,13 @@ function jsonResponse(data: unknown, status = 200, origin?: string) {
 	});
 }
 
-function createToken(username: string) {
-	return jwt.sign({ username }, ISSUER_SECRET, { expiresIn: TOKEN_EXPIRY });
+function createToken(username: string, env: Env) {
+	return jwt.sign({ username }, env.ISSUER_SECRET, { expiresIn: TOKEN_EXPIRY });
 }
 
-async function verifyJWT(token: string) {
+async function verifyJWT(token: string, env: Env) {
 	try {
-		const decoded = jwt.verify(token, ISSUER_SECRET) as { username: string };
+		const decoded = jwt.verify(token, env.ISSUER_SECRET) as { username: string };
 		if (!decoded.username) throw new Error('Invalid token payload');
 		return decoded.username;
 	} catch {
@@ -68,89 +72,100 @@ async function verifyJWT(token: string) {
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const origin = request.headers.get('Origin') || '';
-		const ALLOWED_ORIGIN = 'https://baymax.onslaught2342.qzz.io';
-		if (origin !== ALLOWED_ORIGIN) return new Response('Forbidden', { status: 403 });
+		const isAllowed = ALLOWED_ORIGINS.includes(origin);
+
+		// Handle preflight OPTIONS requests
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				status: 204,
+				headers: corsHeaders(isAllowed ? origin : undefined),
+			});
+		}
+
+		// Reject non-whitelisted origins for actual requests
+		if (!isAllowed) return new Response('Forbidden', { status: 403 });
 
 		const url = new URL(request.url);
 		const path = url.pathname;
 
-		// Preflight
-		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				status: 204,
-				headers: { ...corsHeaders(origin), 'Access-Control-Allow-Credentials': 'false', 'Access-Control-Max-Age': '86400' },
-			});
-		}
-
+		// ------------------------
 		// Signup
+		// ------------------------
 		if (path === '/signup' && request.method === 'POST') {
 			let body: any;
 			try {
 				body = await request.json();
 			} catch {
-				return jsonResponse({ error: 'Invalid JSON' }, 400);
+				return jsonResponse({ error: 'Invalid JSON' }, 400, origin);
 			}
+
 			const { username, password } = body;
-			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400);
+			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, origin);
 
 			const exists = await env.BAYMAX_USERS.get(username);
-			if (exists) return jsonResponse({ error: 'Username already exists' }, 409);
+			if (exists) return jsonResponse({ error: 'Username already exists' }, 409, origin);
 
 			const hashed = await bcrypt.hash(password, 10);
 			await env.BAYMAX_USERS.put(username, hashed);
 
-			const token = createToken(username);
+			const token = createToken(username, env);
 			await env.BAYMAX_USERS.put(`${username}_token`, token);
-			return jsonResponse({ token });
+			return jsonResponse({ token }, 200, origin);
 		}
 
+		// ------------------------
 		// Login
+		// ------------------------
 		if (path === '/login' && request.method === 'POST') {
 			let body: any;
 			try {
 				body = await request.json();
 			} catch {
-				return jsonResponse({ error: 'Invalid JSON' }, 400);
+				return jsonResponse({ error: 'Invalid JSON' }, 400, origin);
 			}
+
 			const { username, password } = body;
-			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400);
+			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, origin);
 
 			const stored = await env.BAYMAX_USERS.get(username);
-			if (!stored) return jsonResponse({ error: 'Invalid credentials' }, 401);
+			if (!stored) return jsonResponse({ error: 'Invalid credentials' }, 401, origin);
 
 			const valid = await bcrypt.compare(password, stored);
-			if (!valid) return jsonResponse({ error: 'Invalid credentials' }, 401);
+			if (!valid) return jsonResponse({ error: 'Invalid credentials' }, 401, origin);
 
-			const token = createToken(username);
+			const token = createToken(username, env);
 			await env.BAYMAX_USERS.put(`${username}_token`, token);
 
-			return jsonResponse({ token });
+			return jsonResponse({ token }, 200, origin);
 		}
 
-		// Verify token endpoint (optional)
+		// ------------------------
+		// Verify token endpoint
+		// ------------------------
 		if (path === '/verify') {
 			const authHeader = request.headers.get('Authorization') || '';
 			const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-			if (!token) return jsonResponse({ error: 'Missing token' }, 401);
+			if (!token) return jsonResponse({ error: 'Missing token' }, 401, origin);
 			try {
-				const username = await verifyJWT(token);
-				return jsonResponse({ username });
+				const username = await verifyJWT(token, env);
+				return jsonResponse({ username }, 200, origin);
 			} catch (err) {
-				return err instanceof Response ? err : jsonResponse({ error: 'Unauthorized' }, 401);
+				return err instanceof Response ? err : jsonResponse({ error: 'Unauthorized' }, 401, origin);
 			}
 		}
 
-		// For all other requests (Baymax chat)
-		if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405);
+		// ------------------------
+		// Baymax Chat (POST only)
+		// ------------------------
+		if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405, origin);
 
-		// Authentication required
 		const authHeader = request.headers.get('Authorization') || '';
 		const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 		if (!token) return new Response('Unauthorized: missing token', { status: 401 });
 
 		let username: string;
 		try {
-			username = await verifyJWT(token);
+			username = await verifyJWT(token, env);
 		} catch (err) {
 			return err instanceof Response ? err : new Response('Unauthorized', { status: 401 });
 		}
@@ -159,7 +174,7 @@ export default {
 		let refreshToken: string | null = null;
 		const decoded: any = jwt.decode(token);
 		if (decoded && decoded.exp && Date.now() / 1000 + TOKEN_REFRESH_THRESHOLD > decoded.exp) {
-			refreshToken = createToken(username);
+			refreshToken = createToken(username, env);
 			await env.BAYMAX_USERS.put(`${username}_token`, refreshToken);
 		}
 
@@ -170,7 +185,8 @@ export default {
 		} catch {
 			return jsonResponse({ error: 'Invalid JSON', refreshToken }, 400, origin);
 		}
-		let userMessage = typeof body.userMessage === 'string' ? body.userMessage.trim() : null;
+
+		const userMessage = typeof body.userMessage === 'string' ? body.userMessage.trim() : null;
 		if (!userMessage) return jsonResponse({ error: 'Missing userMessage', refreshToken }, 400, origin);
 		if (userMessage.length > 20000) return jsonResponse({ error: 'userMessage too long', refreshToken }, 413, origin);
 
