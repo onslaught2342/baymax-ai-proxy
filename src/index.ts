@@ -7,7 +7,7 @@ export interface Env {
 	GROQ_API_KEY: string;
 	CHAT_HISTORY_BAYMAX_PROXY: KVNamespace;
 	VECTOR_API_URL: string;
-	BAYMAX_USERS: KVNamespace; // For auth
+	BAYMAX_USERS: KVNamespace;
 }
 
 interface VectorResult {
@@ -37,24 +37,29 @@ const TOKEN_REFRESH_THRESHOLD = 60;
 
 const ALLOWED_ORIGINS = [
 	'https://baymax.onslaught2342.qzz.io',
-	'https://localhost:5173', // dev origin
+	'http://localhost:5173', // dev
 ];
 
+// Always return CORS headers
 function corsHeaders(origin?: string) {
+	const allowOrigin = origin && ALLOWED_ORIGINS.includes(origin) ? origin : '*';
 	return {
-		'Access-Control-Allow-Origin': origin ?? '*',
+		'Access-Control-Allow-Origin': allowOrigin,
 		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 	};
 }
 
-function jsonResponse(data: unknown, status = 200, origin?: string) {
+// JSON response wrapper
+function jsonResponse(data: unknown, status = 200, request?: Request) {
+	const origin = request?.headers.get('Origin') || '*';
 	return new Response(JSON.stringify(data), {
 		status,
 		headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
 	});
 }
 
+// JWT helpers
 function createToken(username: string, env: Env) {
 	return jwt.sign({ username }, env.ISSUER_SECRET, { expiresIn: TOKEN_EXPIRY });
 }
@@ -71,204 +76,188 @@ async function verifyJWT(token: string, env: Env) {
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		const origin = request.headers.get('Origin') || '';
-		const isAllowed = ALLOWED_ORIGINS.includes(origin);
+		try {
+			const origin = request.headers.get('Origin') || '';
 
-		// Handle preflight OPTIONS requests
-		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				status: 204,
-				headers: corsHeaders(isAllowed ? origin : undefined),
-			});
-		}
-
-		// Reject non-whitelisted origins for actual requests
-		if (!isAllowed) return new Response('Forbidden', { status: 403 });
-
-		const url = new URL(request.url);
-		const path = url.pathname;
-
-		// ------------------------
-		// Signup
-		// ------------------------
-		if (path === '/signup' && request.method === 'POST') {
-			let body: any;
-			try {
-				body = await request.json();
-			} catch {
-				return jsonResponse({ error: 'Invalid JSON' }, 400, origin);
+			// Preflight
+			if (request.method === 'OPTIONS') {
+				return new Response(null, { status: 204, headers: corsHeaders(origin) });
 			}
 
-			const { username, password } = body;
-			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, origin);
+			const url = new URL(request.url);
+			const path = url.pathname;
 
-			const exists = await env.BAYMAX_USERS.get(username);
-			if (exists) return jsonResponse({ error: 'Username already exists' }, 409, origin);
-
-			const hashed = await bcrypt.hash(password, 10);
-			await env.BAYMAX_USERS.put(username, hashed);
-
-			const token = createToken(username, env);
-			await env.BAYMAX_USERS.put(`${username}_token`, token);
-			return jsonResponse({ token }, 200, origin);
-		}
-
-		// ------------------------
-		// Login
-		// ------------------------
-		if (path === '/login' && request.method === 'POST') {
-			let body: any;
-			try {
-				body = await request.json();
-			} catch {
-				return jsonResponse({ error: 'Invalid JSON' }, 400, origin);
+			// Reject non-whitelisted origins for actual requests
+			if (!ALLOWED_ORIGINS.includes(origin)) {
+				return jsonResponse({ error: 'Forbidden origin' }, 403, request);
 			}
 
-			const { username, password } = body;
-			if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, origin);
+			// ------------------------
+			// Signup
+			// ------------------------
+			if (path === '/signup' && request.method === 'POST') {
+				const body = await request.json().catch(() => null);
+				if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400, request);
 
-			const stored = await env.BAYMAX_USERS.get(username);
-			if (!stored) return jsonResponse({ error: 'Invalid credentials' }, 401, origin);
+				const { username, password } = body;
+				if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, request);
 
-			const valid = await bcrypt.compare(password, stored);
-			if (!valid) return jsonResponse({ error: 'Invalid credentials' }, 401, origin);
+				const exists = await env.BAYMAX_USERS.get(username);
+				if (exists) return jsonResponse({ error: 'Username already exists' }, 409, request);
 
-			const token = createToken(username, env);
-			await env.BAYMAX_USERS.put(`${username}_token`, token);
+				const hashed = await bcrypt.hash(password, 10);
+				await env.BAYMAX_USERS.put(username, hashed);
 
-			return jsonResponse({ token }, 200, origin);
-		}
+				const token = createToken(username, env);
+				await env.BAYMAX_USERS.put(`${username}_token`, token);
 
-		// ------------------------
-		// Verify token endpoint
-		// ------------------------
-		if (path === '/verify') {
+				return jsonResponse({ token }, 200, request);
+			}
+
+			// ------------------------
+			// Login
+			// ------------------------
+			if (path === '/login' && request.method === 'POST') {
+				const body = await request.json().catch(() => null);
+				if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400, request);
+
+				const { username, password } = body;
+				if (!username || !password) return jsonResponse({ error: 'Username and password required' }, 400, request);
+
+				const stored = await env.BAYMAX_USERS.get(username);
+				if (!stored) return jsonResponse({ error: 'Invalid credentials' }, 401, request);
+
+				const valid = await bcrypt.compare(password, stored);
+				if (!valid) return jsonResponse({ error: 'Invalid credentials' }, 401, request);
+
+				const token = createToken(username, env);
+				await env.BAYMAX_USERS.put(`${username}_token`, token);
+
+				return jsonResponse({ token }, 200, request);
+			}
+
+			// ------------------------
+			// Verify token
+			// ------------------------
+			if (path === '/verify') {
+				const authHeader = request.headers.get('Authorization') || '';
+				const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+				if (!token) return jsonResponse({ error: 'Missing token' }, 401, request);
+
+				const username = await verifyJWT(token, env);
+				return jsonResponse({ username }, 200, request);
+			}
+
+			// ------------------------
+			// Baymax Chat (POST only)
+			// ------------------------
+			if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405, request);
+
 			const authHeader = request.headers.get('Authorization') || '';
 			const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-			if (!token) return jsonResponse({ error: 'Missing token' }, 401, origin);
+			if (!token) return jsonResponse({ error: 'Unauthorized: missing token' }, 401, request);
+
+			const username = await verifyJWT(token, env);
+
+			// Optionally refresh token
+			let refreshToken: string | null = null;
+			const decoded: any = jwt.decode(token);
+			if (decoded && decoded.exp && Date.now() / 1000 + TOKEN_REFRESH_THRESHOLD > decoded.exp) {
+				refreshToken = createToken(username, env);
+				await env.BAYMAX_USERS.put(`${username}_token`, refreshToken);
+			}
+
+			const body = await request.json().catch(() => null);
+			if (!body) return jsonResponse({ error: 'Invalid JSON', refreshToken }, 400, request);
+
+			const userMessage = typeof body.userMessage === 'string' ? body.userMessage.trim() : null;
+			if (!userMessage) return jsonResponse({ error: 'Missing userMessage', refreshToken }, 400, request);
+			if (userMessage.length > 20000) return jsonResponse({ error: 'userMessage too long', refreshToken }, 413, request);
+
+			const sessionId = body.sessionId;
+			if (!sessionId) return jsonResponse({ error: 'Missing sessionId', refreshToken }, 400, request);
+
+			// Chat history & vector embedding logic
+			const sanitizedInput = userMessage.replace(/\s+/g, ' ').trim();
+			const historyRaw = await env.CHAT_HISTORY_BAYMAX_PROXY.get(sessionId);
+			let history: Array<{ role: string; content: string }> = historyRaw
+				? JSON.parse(historyRaw)
+				: [{ role: 'system', content: 'You are Baymax, a friendly medical AI giving safe health advice.' }];
+
+			history.push({ role: 'user', content: sanitizedInput });
+			const systemMessage = history.find((m) => m.role === 'system') ?? null;
+			const nonSystem = history.filter((m) => m.role !== 'system').slice(-(MAX_HISTORY - (systemMessage ? 1 : 0)));
+			history = systemMessage ? [systemMessage, ...nonSystem] : nonSystem;
+
+			// Vector embedding context
+			let context = '';
+			let embeddings: any[] = [];
 			try {
-				const username = await verifyJWT(token, env);
-				return jsonResponse({ username }, 200, origin);
-			} catch (err) {
-				return err instanceof Response ? err : jsonResponse({ error: 'Unauthorized' }, 401, origin);
+				const vectorRes = await fetch(env.VECTOR_API_URL, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ query: sanitizedInput }),
+				});
+				const vectorData = (await vectorRes.json().catch(() => null)) as VectorResponse | null;
+				if (vectorData?.results?.length) {
+					context = vectorData.results
+						.map((r) => {
+							const name = r['Medicine Name'] ?? 'Unknown';
+							const use = r['Uses'] ?? 'N/A';
+							const side = r['Side_effects'] ?? 'None listed';
+							return `• ${name}: Used for ${use}. Side effects: ${side}`;
+						})
+						.join('\n');
+					embeddings = vectorData.results;
+				}
+			} catch {
+				context = '';
 			}
-		}
 
-		// ------------------------
-		// Baymax Chat (POST only)
-		// ------------------------
-		if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405, origin);
+			if (context)
+				history.unshift({
+					role: 'system',
+					content: `Medical database context:\n${context}\n\nRespond as Baymax, using this data carefully.`,
+				});
 
-		const authHeader = request.headers.get('Authorization') || '';
-		const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-		if (!token) return new Response('Unauthorized: missing token', { status: 401 });
-
-		let username: string;
-		try {
-			username = await verifyJWT(token, env);
-		} catch (err) {
-			return err instanceof Response ? err : new Response('Unauthorized', { status: 401 });
-		}
-
-		// Optionally refresh token
-		let refreshToken: string | null = null;
-		const decoded: any = jwt.decode(token);
-		if (decoded && decoded.exp && Date.now() / 1000 + TOKEN_REFRESH_THRESHOLD > decoded.exp) {
-			refreshToken = createToken(username, env);
-			await env.BAYMAX_USERS.put(`${username}_token`, refreshToken);
-		}
-
-		// Chat logic
-		let body: any;
-		try {
-			body = await request.json();
-		} catch {
-			return jsonResponse({ error: 'Invalid JSON', refreshToken }, 400, origin);
-		}
-
-		const userMessage = typeof body.userMessage === 'string' ? body.userMessage.trim() : null;
-		if (!userMessage) return jsonResponse({ error: 'Missing userMessage', refreshToken }, 400, origin);
-		if (userMessage.length > 20000) return jsonResponse({ error: 'userMessage too long', refreshToken }, 413, origin);
-
-		const sessionId = body.sessionId;
-		if (!sessionId) return jsonResponse({ error: 'Missing sessionId', refreshToken }, 400, origin);
-
-		const sanitizedInput = userMessage.replace(/\s+/g, ' ').trim();
-		const historyRaw = await env.CHAT_HISTORY_BAYMAX_PROXY.get(sessionId);
-		let history: Array<{ role: string; content: string }> = historyRaw
-			? JSON.parse(historyRaw)
-			: [{ role: 'system', content: 'You are Baymax, a friendly medical AI giving safe health advice.' }];
-
-		history.push({ role: 'user', content: sanitizedInput });
-		const systemMessage = history.find((m) => m.role === 'system') ?? null;
-		const nonSystem = history.filter((m) => m.role !== 'system').slice(-(MAX_HISTORY - (systemMessage ? 1 : 0)));
-		history = systemMessage ? [systemMessage, ...nonSystem] : nonSystem;
-
-		// Vector embedding context
-		let context = '';
-		let embeddings: any[] = [];
-		try {
-			const vectorRes = await fetch(env.VECTOR_API_URL, {
+			const groqPayload = { model: 'llama-3.1-8b-instant', messages: history, temperature: 0.7 };
+			const startTime = Date.now();
+			const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ query: sanitizedInput }),
+				headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GROQ_API_KEY}` },
+				body: JSON.stringify(groqPayload),
 			});
-			const vectorData = (await vectorRes.json().catch(() => null)) as VectorResponse | null;
-			if (vectorData?.results?.length) {
-				context = vectorData.results
-					.map((r) => {
-						const name = r['Medicine Name'] ?? 'Unknown';
-						const use = r['Uses'] ?? 'N/A';
-						const side = r['Side_effects'] ?? 'None listed';
-						return `• ${name}: Used for ${use}. Side effects: ${side}`;
-					})
-					.join('\n');
-				embeddings = vectorData.results;
+			const latency = Date.now() - startTime;
+
+			if (!groqRes.ok) {
+				const errText = await groqRes.text().catch(() => '<no-body>');
+				return jsonResponse({ error: 'Upstream model error', upstreamStatus: groqRes.status, detail: errText, refreshToken }, 502, request);
 			}
-		} catch {
-			context = '';
+
+			const data = (await groqRes.json().catch(() => null)) as GroqResponse | null;
+			const rawReply =
+				data?.choices?.[0]?.message?.content ??
+				data?.choices?.[0]?.text ??
+				(typeof data?.reply === 'string' ? data.reply : null) ??
+				'Model returned no reply';
+			const refinedReply = rawReply.trim();
+
+			history.push({ role: 'assistant', content: refinedReply });
+			await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), { expirationTtl: HISTORY_TTL });
+
+			return jsonResponse(
+				{
+					input: { original: userMessage, sanitized: sanitizedInput, embeddings },
+					output: { raw: rawReply, refined: refinedReply, choices: data?.choices ?? null },
+					nonSensitive: { context, metrics: { latency, historyLength: history.length, hallucinationDetected: false } },
+					refreshToken,
+				},
+				200,
+				request
+			);
+		} catch (err: any) {
+			// Always respond with CORS headers on unexpected errors
+			return jsonResponse({ error: err.message ?? 'Internal Server Error' }, 500, request);
 		}
-
-		if (context)
-			history.unshift({
-				role: 'system',
-				content: `Medical database context:\n${context}\n\nRespond as Baymax, using this data carefully.`,
-			});
-
-		const groqPayload = { model: 'llama-3.1-8b-instant', messages: history, temperature: 0.7 };
-		const startTime = Date.now();
-		const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GROQ_API_KEY}` },
-			body: JSON.stringify(groqPayload),
-		});
-		const latency = Date.now() - startTime;
-
-		if (!groqRes.ok) {
-			const errText = await groqRes.text().catch(() => '<no-body>');
-			return jsonResponse({ error: 'Upstream model error', upstreamStatus: groqRes.status, detail: errText, refreshToken }, 502, origin);
-		}
-
-		const data = (await groqRes.json().catch(() => null)) as GroqResponse | null;
-		const rawReply =
-			data?.choices?.[0]?.message?.content ??
-			data?.choices?.[0]?.text ??
-			(typeof data?.reply === 'string' ? data.reply : null) ??
-			'Model returned no reply';
-		const refinedReply = rawReply.trim();
-
-		history.push({ role: 'assistant', content: refinedReply });
-		await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), { expirationTtl: HISTORY_TTL });
-
-		return jsonResponse(
-			{
-				input: { original: userMessage, sanitized: sanitizedInput, embeddings },
-				output: { raw: rawReply, refined: refinedReply, choices: data?.choices ?? null },
-				nonSensitive: { context, metrics: { latency, historyLength: history.length, hallucinationDetected: false } },
-				refreshToken,
-			},
-			200,
-			origin
-		);
 	},
 };
