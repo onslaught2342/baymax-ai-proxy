@@ -35,7 +35,7 @@ const MAX_HISTORY = 20;
 const HISTORY_TTL = 60 * 60 * 24 * 30;
 const TOKEN_EXPIRY = 60 * 60;
 const TOKEN_REFRESH_THRESHOLD = 60;
-const ALLOWED_ORIGINS = ['https://baymax.onslaught2342.qzz.io/'];
+const ALLOWED_ORIGINS = ['https://baymax.onslaught2342.qzz.io'];
 
 const LOGIN_ATTEMPT_LIMIT = 5;
 const LOGIN_BLOCK_TTL = 60 * 15;
