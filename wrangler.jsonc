@@ -12,6 +12,10 @@
 			"id": "990a6e0dfc844e54a7bc8c56478b6e17"
 		},
 		{
+			"binding": "profanity_ai",
+			"id": "1f4a2c9a7d8d4eeeb5ae093d4c5a758b"
+		},
+		{
 			"binding": "BAYMAX_USERS",
 			"id": "bfe537428733455280bc35ed0d388540"
 		}

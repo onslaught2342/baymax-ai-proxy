@@ -8,6 +8,7 @@ export interface Env {
 	CHAT_HISTORY_BAYMAX_PROXY: KVNamespace;
 	VECTOR_API_URL: string;
 	BAYMAX_USERS: KVNamespace;
+	profanity_ai: KVNamespace;
 }
 
 interface VectorResult {
@@ -66,7 +67,7 @@ async function verifyJWT(token: string, env: Env) {
 		const decoded = jwt.verify(token, env.ISSUER_SECRET) as { username?: string; exp?: number };
 		if (!decoded || !decoded.username) throw new Error('Invalid token payload');
 		return decoded.username;
-	} catch (e) {
+	} catch {
 		throw new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 }
@@ -107,53 +108,36 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		try {
 			const origin = request.headers.get('Origin') || '';
-
-			if (request.method === 'OPTIONS') {
-				return new Response(null, { status: 204, headers: corsHeaders(origin) });
-			}
-
+			if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(origin) });
 			const url = new URL(request.url);
 			const path = url.pathname;
-
-			if (!ALLOWED_ORIGINS.includes(origin)) {
-				return jsonResponse({ error: 'Forbidden origin' }, 403, request);
-			}
+			if (!ALLOWED_ORIGINS.includes(origin)) return jsonResponse({ error: 'Forbidden origin' }, 403, request);
 
 			if (path === '/signup' && request.method === 'POST') {
 				const body = await parseJsonLimited(request).catch(() => null);
 				if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400, request);
-
 				const { username, password } = body;
-				if (!isValidUsername(username) || !isValidPassword(password)) {
+				if (!isValidUsername(username) || !isValidPassword(password))
 					return jsonResponse({ error: 'Invalid username or password format' }, 400, request);
-				}
-
 				const exists = await env.BAYMAX_USERS.get(username);
 				if (exists) return jsonResponse({ error: 'Username already exists' }, 409, request);
-
 				const hashed = await bcrypt.hash(password, 10);
 				await env.BAYMAX_USERS.put(username, hashed);
-
 				const token = createToken(username, env);
 				await env.BAYMAX_USERS.put(`${username}_token`, token);
-
 				return jsonResponse({ token }, 200, request);
 			}
 
 			if (path === '/login' && request.method === 'POST') {
 				const body = await parseJsonLimited(request).catch(() => null);
 				if (!body) return jsonResponse({ error: 'Invalid JSON' }, 400, request);
-
 				const { username, password } = body;
-				if (!isValidUsername(username) || !isValidPassword(password)) {
+				if (!isValidUsername(username) || !isValidPassword(password))
 					return jsonResponse({ error: 'Username and password required' }, 400, request);
-				}
-
 				const blockKey = `${username}_login_block`;
 				const attemptsKey = `${username}_login_attempts`;
 				const blocked = await env.BAYMAX_USERS.get(blockKey);
 				if (blocked) return jsonResponse({ error: 'Too many login attempts. Try later.' }, 429, request);
-
 				const stored = await env.BAYMAX_USERS.get(username);
 				if (!stored) {
 					const curAttempts = Number((await env.BAYMAX_USERS.get(attemptsKey)) || 0) + 1;
@@ -164,7 +148,6 @@ export default {
 					}
 					return jsonResponse({ error: 'Invalid credentials' }, 401, request);
 				}
-
 				const valid = await bcrypt.compare(password, stored);
 				if (!valid) {
 					const curAttempts = Number((await env.BAYMAX_USERS.get(attemptsKey)) || 0) + 1;
@@ -175,13 +158,10 @@ export default {
 					}
 					return jsonResponse({ error: 'Invalid credentials' }, 401, request);
 				}
-
 				await env.BAYMAX_USERS.delete(attemptsKey);
 				await env.BAYMAX_USERS.delete(blockKey);
-
 				const token = createToken(username, env);
 				await env.BAYMAX_USERS.put(`${username}_token`, token);
-
 				return jsonResponse({ token }, 200, request);
 			}
 
@@ -189,19 +169,15 @@ export default {
 				const authHeader = request.headers.get('Authorization') || '';
 				const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 				if (!token) return jsonResponse({ error: 'Missing token' }, 401, request);
-
 				const username = await verifyJWT(token, env);
 				return jsonResponse({ username }, 200, request);
 			}
 
 			if (request.method !== 'POST') return jsonResponse({ error: 'Only POST allowed' }, 405, request);
-
 			const authHeader = request.headers.get('Authorization') || '';
 			const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 			if (!token) return jsonResponse({ error: 'Unauthorized: missing token' }, 401, request);
-
 			const username = await verifyJWT(token, env);
-
 			let refreshToken: string | null = null;
 			const decoded: any = jwt.decode(token);
 			if (decoded && decoded.exp && Date.now() / 1000 + TOKEN_REFRESH_THRESHOLD > decoded.exp) {
@@ -217,20 +193,38 @@ export default {
 			if (userMessage.length > 20000) return jsonResponse({ error: 'userMessage too long', refreshToken }, 413, request);
 
 			const sessionId = body.sessionId;
-			if (!sessionId || typeof sessionId !== 'string' || sessionId.length > 256) {
+			if (!sessionId || typeof sessionId !== 'string' || sessionId.length > 256)
 				return jsonResponse({ error: 'Missing or invalid sessionId', refreshToken }, 400, request);
-			}
 
 			const sanitizedInput = userMessage.replace(/\s+/g, ' ').trim();
 			const historyRaw = await env.CHAT_HISTORY_BAYMAX_PROXY.get(sessionId);
 			let history: Array<{ role: string; content: string }> = historyRaw
 				? JSON.parse(historyRaw)
 				: [{ role: 'system', content: 'You are Baymax, a friendly medical AI giving safe health advice.' }];
-
 			history.push({ role: 'user', content: sanitizedInput });
 			const systemMessage = history.find((m) => m.role === 'system') ?? null;
 			const nonSystem = history.filter((m) => m.role !== 'system').slice(-(MAX_HISTORY - (systemMessage ? 1 : 0)));
 			history = systemMessage ? [systemMessage, ...nonSystem] : nonSystem;
+
+			const profanityListRaw = await env.profanity_ai.get('bad_words');
+			const profanityList = profanityListRaw?.split(/\s+/) ?? [];
+			const containsProfanity = profanityList.some((word) => sanitizedInput.toLowerCase().includes(word.toLowerCase()));
+
+			if (containsProfanity) {
+				const filteredReply = 'No foul words allowed.';
+				history.push({ role: 'assistant', content: filteredReply });
+				await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), { expirationTtl: HISTORY_TTL });
+				return jsonResponse(
+					{
+						input: { original: userMessage, sanitized: sanitizedInput, embeddings: [] },
+						output: { raw: filteredReply, refined: filteredReply, choices: null },
+						nonSensitive: { context: '', metrics: { latency: 0, historyLength: history.length, hallucinationDetected: false } },
+						refreshToken,
+					},
+					200,
+					request
+				);
+			}
 
 			let context = '';
 			let embeddings: any[] = [];
@@ -258,20 +252,15 @@ export default {
 						embeddings = vectorData.results;
 					}
 				}
-			} catch (err) {
-				context = '';
-			}
-
-			if (context) {
+			} catch {}
+			if (context)
 				history.unshift({
 					role: 'system',
 					content: `Medical database context:\n${context}\n\nRespond as Baymax, using this data carefully.`,
 				});
-			}
 
 			const groqPayload = { model: 'llama-3.1-8b-instant', messages: history, temperature: 0.7 };
 			const startTime = Date.now();
-
 			const groqRes = await fetchWithTimeout(
 				'https://api.groq.com/openai/v1/chat/completions',
 				{
@@ -282,7 +271,6 @@ export default {
 				12000
 			);
 			const latency = Date.now() - startTime;
-
 			if (!groqRes || !groqRes.ok) {
 				const errText = groqRes ? await groqRes.text().catch(() => '<no-body>') : '<no-response>';
 				return jsonResponse(
@@ -299,7 +287,6 @@ export default {
 				(typeof data?.reply === 'string' ? data.reply : null) ??
 				'Model returned no reply';
 			const refinedReply = typeof rawReply === 'string' ? rawReply.trim() : String(rawReply);
-
 			history.push({ role: 'assistant', content: refinedReply });
 			await env.CHAT_HISTORY_BAYMAX_PROXY.put(sessionId, JSON.stringify(history), { expirationTtl: HISTORY_TTL });
 
@@ -315,7 +302,6 @@ export default {
 			);
 		} catch (err: any) {
 			if (err instanceof Response) return err;
-			console.error('Unhandled worker error:', err);
 			return jsonResponse({ error: err.message ?? 'Internal Server Error' }, 500);
 		}
 	},
