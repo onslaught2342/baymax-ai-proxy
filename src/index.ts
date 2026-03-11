@@ -242,7 +242,7 @@ export default {
 						headers: { 'Content-Type': 'application/json' },
 						body: JSON.stringify({ query: sanitizedInput }),
 					},
-					4000
+					4000,
 				);
 				if (vectorRes && vectorRes.ok) {
 					const vectorData = (await vectorRes.json().catch(() => null)) as VectorResponse | null;
@@ -279,7 +279,7 @@ export default {
 					headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GROQ_API_KEY}` },
 					body: JSON.stringify(groqPayload),
 				},
-				12000
+				12000,
 			);
 			const latency = Date.now() - startTime;
 
@@ -288,7 +288,7 @@ export default {
 				return jsonResponse(
 					{ error: 'Upstream model error', upstreamStatus: groqRes?.status ?? 0, detail: errText, refreshToken },
 					502,
-					request
+					request,
 				);
 			}
 
@@ -311,7 +311,7 @@ export default {
 					refreshToken,
 				},
 				200,
-				request
+				request,
 			);
 		} catch (err: any) {
 			if (err instanceof Response) return err;
